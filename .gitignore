@@ -1,0 +1,9 @@
+
+# Output directories
+/outputs/
+/data/
+**/build/
+
+# Cache directory
+**/__cache__
+**/__pycache__
