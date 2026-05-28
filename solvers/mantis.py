@@ -62,7 +62,7 @@ class Solver(BaseSolver):
 
         device = "cuda" if torch.cuda.is_available() else "cpu"
 
-        # Load the model and trainer only on the first call for this checkpoint.
+        # Load the model only on the first call for this checkpoint.
         should_reload = (
             not hasattr(self, "_network")
             or not hasattr(self, "_loaded_checkpoint")
@@ -79,15 +79,19 @@ class Solver(BaseSolver):
                 network = network.from_pretrained(self.checkpoint)
 
                 self._network = network
-                self._trainer = MantisTrainer(device=device, network=self._network)
+                self._trainer = MantisTrainer(
+                    device=device, network=self._network
+                )
                 self._loaded_checkpoint = self.checkpoint
                 print(
-                    f"✓ Mantis checkpoint loaded: {self.checkpoint} on device: {device}"
+                    f"✓ Mantis checkpoint loaded: {self.checkpoint} "
+                    f"on device: {device}"
                 )
             except Exception as e:
                 raise RuntimeError(
-                    f"Failed to load Mantis checkpoint '{self.checkpoint}' from Hugging Face: {e}. "
-                    "Make sure you have internet access and the model is available."
+                    f"Failed to load Mantis checkpoint '{self.checkpoint}' "
+                    f"from Hugging Face: {e}. Make sure you have internet "
+                    "access and the model is available."
                 )
 
         self.model = make_pipeline(
@@ -103,7 +107,7 @@ class Solver(BaseSolver):
         self._device = device
 
     def run(self, _):
-        """Extract embeddings and train Random Forest classifier (this is the timed section)."""
+        """Fit the model on the training data."""
         self.model.fit(self.X_train, self.y_train)
 
     def _extract_embeddings(self, X):
@@ -112,7 +116,9 @@ class Solver(BaseSolver):
         Parameters
         ----------
         X : np.ndarray
-            Input time series of shape (n_samples, num_variates, sequence_length)
+            Input time series of shape (N, T, C) where N is the number
+            of series, T is the sequence length, and C the number of channels.
+            Note that Mantis expects (N, C, T) internally.
         batch_size : int
             Batch size for processing
 
@@ -141,7 +147,9 @@ class Solver(BaseSolver):
                     embedding_dim = all_embeddings[0].shape[1]
                 else:
                     embedding_dim = 128
-                all_embeddings.append(np.zeros((batch_end - batch_idx, embedding_dim), dtype=np.float32))
+                all_embeddings.append(np.zeros(
+                    (batch_end - batch_idx, embedding_dim), dtype=np.float32)
+                )
 
         # Concatenate all embeddings
         if all_embeddings:
@@ -154,8 +162,8 @@ class Solver(BaseSolver):
     def _prepare_inputs(self, X_batch):
         """Ensure Mantis-compatible shape and sequence length.
 
-        Mantis expects arrays of shape (n_samples, n_channels, seq_len), and the
-        sequence length should be divisible by 32. Following official guidance,
+        Mantis expects arrays of shape (N, C, T), and the sequence length
+        should be divisible by 32. Following official guidance,
         we interpolate to ``interpolate_to`` (default 512).
         """
         X_in = X_batch.transpose(0, 2, 1)
@@ -175,7 +183,8 @@ class Solver(BaseSolver):
 
         if X_in.shape[-1] % 32 != 0:
             raise ValueError(
-                f"Sequence length must be divisible by 32 for Mantis, got {X_in.shape[-1]}"
+                "Sequence length must be divisible by 32 for Mantis, "
+                f"got {X_in.shape[-1]}"
             )
 
         return X_in
