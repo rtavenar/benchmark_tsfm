@@ -1,10 +1,11 @@
-"""Chronos-2 solver for the TSFM benchmark (local inference).
+"""Chronos solver for the TSFM benchmark (local inference).
 
 Supports:
-  - forecasting        : zero-shot via ``Chronos2Pipeline``
+  - forecasting     : zero-shot via ChronosPipeline
+  - classification  : linear probe on pooled encoder embeddings
   - anomaly_detection  : forecast-residual on top of the same forecaster
 
-Classification is not yet implemented; the solver skips that task.
+Anomaly detection is currently broken and skipped.
 
 Model loading is done in ``set_objective`` (untimed). Inference batches
 every (series, cutoff) pair into a single ``Chronos2Pipeline.predict``
@@ -16,15 +17,28 @@ one forward pass.
 import numpy as np
 import torch
 from benchopt import BaseSolver
+from chronos import ChronosPipeline
 
+from benchmark_utils.adapters import (
+    Encoder,
+    LastPooler,
+    LinearProbeAdapter,
+    MaxPooler,
+    MeanPooler,
+    UnpooledEncoder,
+)
 from benchmark_utils.adapters.base import BaseTSFMAdapter
-from chronos import Chronos2Pipeline, ChronosPipeline
-from benchmark_utils.adapters import UnpooledEncoder
 from benchmark_utils.adapters.forecast_residual import ForecastResidualAdapter
 from benchmark_utils.inputs import ForecastInput
 from benchmark_utils.outputs import ForecastOutput
 
-SUPPORTED_TASKS = {"forecasting", "anomaly_detection"}
+SUPPORTED_TASKS = {"forecasting", "classification", "anomaly_detection"}
+
+POOLERS = {
+    "mean": MeanPooler,
+    "max": MaxPooler,
+    "last": LastPooler,
+}
 
 
 class _ChronosForecaster(BaseTSFMAdapter):
@@ -37,8 +51,8 @@ class _ChronosForecaster(BaseTSFMAdapter):
 
     def predict(self, x: ForecastInput) -> ForecastOutput:
         inputs = []
-        layout = []              # (series_idx, cutoff_idx) per input element
-        per_series_shape = []    # (C, n_cutoffs) per series
+        layout = []  # (series_idx, cutoff_idx) per input element
+        per_series_shape = []  # (C, n_cutoffs) per series
         for series_idx, (series, cutoffs) in enumerate(zip(x.x, x.cutoff_indexes)):
             series = np.asarray(series, dtype=np.float32)
             if series.ndim == 1:
@@ -46,7 +60,7 @@ class _ChronosForecaster(BaseTSFMAdapter):
             _, C = series.shape
             per_series_shape.append((C, len(cutoffs)))
             for cutoff_idx, cutoff in enumerate(cutoffs):
-                hist = series[:cutoff]                   # (T_cutoff, C)
+                hist = series[:cutoff]  # (T_cutoff, C)
                 inputs.append(torch.from_numpy(hist.T))  # (C, T_cutoff)
                 layout.append((series_idx, cutoff_idx))
 
@@ -66,38 +80,38 @@ class _ChronosForecaster(BaseTSFMAdapter):
             for C, n_cutoffs in per_series_shape
         ]
         for (series_idx, cutoff_idx), pred in zip(layout, forecast):
-            arr = pred.float().cpu().numpy()                # (C, Q, H)
+            arr = pred.float().cpu().numpy()  # (C, Q, H)
             per_series[series_idx][cutoff_idx] = arr.transpose(1, 2, 0)
-        return ForecastOutput(quantiles=per_series, quantile_levels=self.quantile_levels)
+        return ForecastOutput(
+            quantiles=per_series, quantile_levels=self.quantile_levels
+        )
 
-def _to_context_tensor(x: np.ndarray):
-    """Convert ``(T,)`` or ``(T, C)`` array to ``(C, T)`` float32 tensor.
 
-    Channels become the batch dim so a single Chronos forward pass covers
-    all of them — Chronos is univariate, so channels are independent.
-    """
-
+def _to_context(x):
+    """Reshape ``(T, V)`` or ``(B, T, V)`` to Chronos input ``(B, V, T)``."""
     x = np.asarray(x, dtype=np.float32)
-    if x.ndim == 1:
-        x = x[:, None]
-    return torch.from_numpy(x.T)
+    if x.ndim == 2:
+        x = x[None]
+    return x.transpose(0, 2, 1)
 
 
 class _ChronosEmbedEncoder(UnpooledEncoder):
-    """Default path — uses ``ChronosPipeline.embed``.
+    """Default path — uses ``Chronos2Pipeline.embed``.
 
-    Returns hidden states *after* ``encoder.final_layer_norm``.
+    Returns hidden states *after* ``encoder.final_layer_norm`` for each
+    series in the batch.
     """
 
     def __init__(self, pipeline: ChronosPipeline):
         self.pipeline = pipeline
 
-    def encode(self, x: np.ndarray) -> np.ndarray:
-        context = _to_context_tensor(x)  # (C, T)
+    def encode(self, X) -> np.ndarray:
+        context = _to_context(X)  # (B, V, T)
         with torch.no_grad():
-            embeddings, _ = self.pipeline.embed(context)  # (C, T_tok, D)
-        # (C, T_tok, D) -> (T_tok, C, D)
-        return embeddings.transpose(0, 1).float().cpu().numpy()
+            # embed returns a list of B tensors, each of shape (V, T, D).
+            embeddings, _ = self.pipeline.embed(context)
+        stacked = torch.stack(list(embeddings))  # (B, V, T, D)
+        return stacked.transpose(1, 2).float().cpu().numpy()  # (B, T, V, D)
 
 
 class _ChronosHookEncoder(UnpooledEncoder):
@@ -117,9 +131,9 @@ class _ChronosHookEncoder(UnpooledEncoder):
         self._block_idx = layer % n_blocks
 
     def encode(self, x: np.ndarray) -> np.ndarray:
-        context = _to_context_tensor(x)  # (C, T)
-        token_ids, attn_mask, _ = (
-            self.pipeline.tokenizer.context_input_transform(context)
+        context = _to_context(x)  # (B, V, T)
+        token_ids, attn_mask, _ = self.pipeline.tokenizer.context_input_transform(
+            context
         )
         device = self.pipeline.model.device
         token_ids = token_ids.to(device)
@@ -189,7 +203,12 @@ class Solver(BaseSolver):
     Parameters
     ----------
     model_size : str
-        Chronos-2 variant suffix used in ``autogluon/chronos-2-{model_size}``.
+        Chronos model variant: "tiny", "mini", "small", "base", "large".
+    layer : int or None
+        Encoder block index for classification embeddings. ``None`` uses
+        ``ChronosPipeline.embed`` (post-final-norm).
+    pooler : {"mean", "max", "last"}
+        Pooling strategy over the time-token axis for classification.
     task_adaptation : str
         Per-task usage of the forecaster:
           ``"zeroshot"``          — direct forecasting (forecasting only)
@@ -204,7 +223,8 @@ class Solver(BaseSolver):
 
     parameters = {
         "model_size": ["small"],
-        "task_adaptation": ["zeroshot"],
+        "layer": [None],
+        "pooler": ["mean"],
     }
 
     def skip(self, task, **kwargs):
@@ -217,6 +237,7 @@ class Solver(BaseSolver):
 
         self.task = task
         self.X_train = X_train
+        self.y_train = y_train
         self.meta = meta
 
         # bfloat16 is fine on CUDA but poorly supported on CPU / MPS;
@@ -236,6 +257,18 @@ class Solver(BaseSolver):
         pred_len = self.meta.get("prediction_length", 1)
         if self.task == "forecasting":
             self._adapter = _ChronosForecaster(self._pipeline, pred_len)
+
+        elif self.task == "classification":
+            base_encoder = ChronosEncoder(self._pipeline, layer=self.layer)
+            encoder = Encoder(base_encoder, POOLERS[self.pooler]())
+            adapter = LinearProbeAdapter(
+                encoder,
+                task="classification",
+                n_classes=self.meta.get("n_classes"),
+            )
+            adapter.fit(self.X_train, self.y_train)
+            self._adapter = adapter
+
         elif self.task == "anomaly_detection":
             # AD uses one-step-ahead forecasts.
             self._adapter = ForecastResidualAdapter(
